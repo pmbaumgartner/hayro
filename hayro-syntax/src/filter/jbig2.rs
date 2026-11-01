@@ -57,6 +57,51 @@ pub(crate) fn decode(
         image.decode(&mut decoder).ok()?;
 
         (packed, 1)
+    } else if let Some(sink) =
+        super::ReduceSink::new(image.width(), image.height(), image_params.target_dimension)
+    {
+        struct Reduce(super::ReduceSink);
+
+        impl hayro_jbig2::Decoder for Reduce {
+            fn push_pixel(&mut self, black: bool) {
+                self.0.run(!black, 1);
+            }
+
+            fn push_pixel_chunk(&mut self, black: bool, chunk_count: u32) {
+                self.0.run(!black, chunk_count as usize * 8);
+            }
+
+            fn next_line(&mut self) {
+                self.0.end_row();
+            }
+        }
+
+        let (width, height) = sink.size();
+        let mut decoder = Reduce(sink);
+        let program = if globals.is_none() {
+            super::jbig2_stream::Program::probe(
+                data,
+                image.width() as usize,
+                image.height() as usize,
+            )
+        } else {
+            None
+        };
+        if let Some(program) = program {
+            program.decode(|row, repeated| decoder.0.packed_row(row, repeated));
+        } else {
+            image.decode(&mut decoder).ok()?;
+        }
+        return Some(FilterResult {
+            data: Cow::Owned(decoder.0.finish()),
+            image_data: Some(ImageData {
+                alpha: None,
+                color_space: Some(ImageColorSpace::Gray),
+                bits_per_component: 8,
+                width,
+                height,
+            }),
+        });
     } else {
         struct Luma8Decoder {
             output: Vec<u8>,

@@ -24,6 +24,10 @@ pub(crate) fn decode(
     // are too large (if they are too small, they will just be padded later on).
     let data = maybe_patch_jpeg_dimensions(data, image_params)?;
 
+    if let Some(result) = decode_scaled(&data, params, image_params) {
+        return Some(result);
+    }
+
     let options = DecoderOptions::default()
         .set_max_width(u16::MAX as usize)
         .set_max_height(u16::MAX as usize);
@@ -178,4 +182,54 @@ fn find_sof_marker(data: &[u8]) -> Option<usize> {
     }
 
     None
+}
+
+/// Decode at a reduced size (1/2, 1/4 or 1/8 via a reduced IDCT) when the target
+/// is at most half the image in both directions. Gray and RGB outputs only.
+fn decode_scaled(
+    data: &[u8],
+    params: &Dict<'_>,
+    image_params: &ImageDecodeParams,
+) -> Option<FilterResult<'static>> {
+    let (tw, th) = image_params.target_dimension?;
+    if tw.max(1) * 2 > image_params.width || th.max(1) * 2 > image_params.height {
+        return None;
+    }
+    if params.get::<u8>(COLOR_TRANSFORM) == Some(0) {
+        return None;
+    }
+    let mut decoder = jpeg_decoder::Decoder::new(data);
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    if !matches!(
+        info.pixel_format,
+        jpeg_decoder::PixelFormat::L8 | jpeg_decoder::PixelFormat::RGB24
+    ) || image_params
+        .num_components
+        .is_some_and(|n| n as usize != info.pixel_format.pixel_bytes())
+    {
+        return None;
+    }
+    let (w, h) = decoder
+        .scale(
+            tw.clamp(1, u16::MAX as u32) as u16,
+            th.clamp(1, u16::MAX as u32) as u16,
+        )
+        .ok()?;
+    let decoded = decoder.decode().ok()?;
+    let gray = info.pixel_format == jpeg_decoder::PixelFormat::L8;
+    Some(FilterResult {
+        data: Cow::Owned(decoded),
+        image_data: Some(ImageData {
+            alpha: None,
+            color_space: Some(if gray {
+                ImageColorSpace::Gray
+            } else {
+                ImageColorSpace::Rgb
+            }),
+            bits_per_component: 8,
+            width: w as u32,
+            height: h as u32,
+        }),
+    })
 }

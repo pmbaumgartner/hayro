@@ -123,6 +123,39 @@ pub(crate) fn decode(
         }
 
         (decoder.output, 1)
+    } else if let Some(sink) =
+        super::ReduceSink::new(settings.columns, rows, image_params.target_dimension)
+    {
+        struct Reduce(super::ReduceSink, u32);
+
+        impl Decoder for Reduce {
+            fn push_pixels(&mut self, white: bool, count: u32) {
+                self.0.run(white, count as usize);
+            }
+
+            fn next_line(&mut self) {
+                self.1 += 1;
+                self.0.end_row();
+            }
+        }
+
+        let (width, height) = sink.size();
+        let mut decoder = Reduce(sink, 0);
+        let mut context = DecoderContext::new(settings);
+        let result = hayro_ccitt::decode(data, &mut decoder, &mut context);
+        if result.is_err() && decoder.1 == 0 {
+            return None;
+        }
+        return Some(FilterResult {
+            data: Cow::Owned(decoder.0.finish()),
+            image_data: Some(ImageData {
+                alpha: None,
+                color_space: Some(ImageColorSpace::Gray),
+                bits_per_component: 8,
+                width,
+                height,
+            }),
+        });
     } else {
         struct Luma8Decoder {
             output: Vec<u8>,

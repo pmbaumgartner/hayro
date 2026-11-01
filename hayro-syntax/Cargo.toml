@@ -29,6 +29,8 @@ log = { workspace = true, optional = true }
 rustc-hash = { workspace = true, optional = true }
 smallvec = { workspace = true }
 flate2 = { workspace = true, optional = true, features = ["zlib-rs"] }
+# Scaled IDCT for JPEG images drawn smaller than stored.
+jpeg-decoder = { version = "=0.3.2", default-features = false }
 memchr = { workspace = true, optional = true }
 
 zune-jpeg = { workspace = true, optional = true }
