@@ -268,6 +268,27 @@ impl CacheKey for TilingPattern<'_> {
     }
 }
 
+impl TilingPattern<'_> {
+    /// Identifies what `interpret` draws for a fill (or stroke) under the
+    /// current matrix: the pattern, its matrix and context bounds, and for an
+    /// uncolored pattern its paint.
+    pub fn cell_key(&self, is_stroke: bool) -> u128 {
+        let paint = match (self.is_color, is_stroke) {
+            (true, _) => None,
+            (false, false) => Some(&self.non_stroking_paint),
+            (false, true) => Some(&self.stroke_paint),
+        }
+        .map(|c| c.to_rgba().premultiplied().map(f32::to_bits));
+        hash128(&(
+            self.cache_key,
+            self.matrix.cache_key(),
+            self.ctx_bbox.cache_key(),
+            is_stroke,
+            paint,
+        ))
+    }
+}
+
 struct StencilPatternDevice<'a, 'b, T: Device<'a>> {
     inner: &'b mut T,
     paint: Paint<'a>,
