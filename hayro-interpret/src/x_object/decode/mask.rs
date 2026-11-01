@@ -25,8 +25,8 @@ pub(crate) fn decode_mask(
     target_dimension: Option<(u32, u32)>,
 ) -> Option<DecodedMask> {
     let ctx = decode_context(obj, target_dimension)?;
-    let width = ctx.width;
-    let scale_factors = ctx.scale_factors;
+    let mut width = ctx.width;
+    let mut scale_factors = ctx.scale_factors;
 
     // Note: The semantics between "normal" soft masks (i.e. masks defined in
     // the graphics state or via `Mask`/`SMask` are inverted compared to
@@ -35,7 +35,10 @@ pub(crate) fn decode_mask(
     // fully opaque. For stencil masks, it's the other way around: 1 means the
     // paint is visible, while 0 means it's invisible.
     let invert = obj.kind == ImageKind::StencilMask;
-    let (data, height) = decode_mask_data(ctx, invert)?;
+    let (mut data, mut height) = decode_mask_data(ctx, invert)?;
+    if let Some(target) = target_dimension {
+        data = super::box_reduce(data, &mut width, &mut height, &mut scale_factors, 1, target);
+    }
 
     Some(DecodedMask {
         luma: LumaData {

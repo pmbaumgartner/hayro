@@ -130,6 +130,21 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
             components
         };
 
+        if !is_indexed
+            && self.color_key_mask.is_none()
+            && self.obj.stream.dict().get::<u8>(SMASK_IN_DATA) != Some(1)
+            && let Some((tw, th)) = self.target_dimension
+        {
+            components = super::box_reduce(
+                components,
+                &mut self.ctx.width,
+                &mut self.ctx.height,
+                &mut self.ctx.scale_factors,
+                num_components,
+                (tw, th),
+            );
+        }
+
         if self
             .obj
             .transfer_function

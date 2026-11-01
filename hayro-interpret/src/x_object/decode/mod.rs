@@ -275,3 +275,52 @@ fn for_each_sample(
 
     Some(())
 }
+
+/// Average `fx` x `fy` blocks of 8-bit components when the image is at least twice
+/// the target in a direction. Updates the size and the scale factors to match.
+pub(crate) fn box_reduce(
+    data: Vec<u8>,
+    width: &mut u32,
+    height: &mut u32,
+    scale_factors: &mut (f32, f32),
+    nc: usize,
+    (tw, th): (u32, u32),
+) -> Vec<u8> {
+    let (w, h) = (*width as usize, *height as usize);
+    let fx = (w / tw.max(1) as usize).max(1);
+    let fy = (h / th.max(1) as usize).max(1);
+    if (fx < 2 && fy < 2) || data.len() < w * h * nc {
+        return data;
+    }
+    let (ow, oh) = (w.div_ceil(fx), h.div_ceil(fy));
+    let mut out = Vec::with_capacity(ow * oh * nc);
+    let mut acc = vec![0_u32; w * nc];
+    for oy in 0..oh {
+        acc.iter_mut().for_each(|a| *a = 0);
+        let rows = (oy * fy)..((oy + 1) * fy).min(h);
+        let n_rows = rows.len() as u32;
+        for y in rows {
+            let row = &data[y * w * nc..(y + 1) * w * nc];
+            for (a, &v) in acc.iter_mut().zip(row) {
+                *a += v as u32;
+            }
+        }
+        for ox in 0..ow {
+            let x0 = ox * fx;
+            let x1 = ((ox + 1) * fx).min(w);
+            let n = n_rows * (x1 - x0) as u32;
+            for c in 0..nc {
+                let mut sum = 0_u32;
+                for x in x0..x1 {
+                    sum += acc[x * nc + c];
+                }
+                out.push(((sum + n / 2) / n) as u8);
+            }
+        }
+    }
+    scale_factors.0 *= w as f32 / ow as f32;
+    scale_factors.1 *= h as f32 / oh as f32;
+    *width = ow as u32;
+    *height = oh as u32;
+    out
+}
