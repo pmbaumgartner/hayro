@@ -54,6 +54,19 @@ pub struct ImageDecodeParams {
     pub height: u32,
 }
 
+impl ImageDecodeParams {
+    /// The most bytes an image's samples can take once unfiltered, allowing a
+    /// PNG predictor tag per row, when the dictionary gives every dimension.
+    fn raw_size(&self) -> Option<usize> {
+        let bits = (self.width as usize)
+            .checked_mul(usize::from(self.num_components?))?
+            .checked_mul(usize::from(self.bpc?))?;
+        (self.height as usize)
+            .checked_mul(bits.div_ceil(8) + 1)
+            .filter(|&n| n > 0)
+    }
+}
+
 impl<'a> Stream<'a> {
     pub(crate) fn new(data: &'a [u8], dict: Dict<'a>) -> Self {
         Self { dict, data }
@@ -175,16 +188,20 @@ impl<'a> Stream<'a> {
         let filters_and_params = self.filters_and_params();
 
         let mut current: Option<FilterResult<'a>> = None;
+        let last = filters_and_params.filters.len().saturating_sub(1);
 
-        for (filter, params) in filters_and_params
+        for (index, (filter, params)) in filters_and_params
             .filters
             .iter()
             .zip(filters_and_params.params.iter())
+            .enumerate()
         {
+            let expected = (index == last).then(|| image_params.raw_size()).flatten();
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
+                expected,
             )?;
             current = Some(new);
         }

@@ -10,37 +10,45 @@ pub(crate) mod flate {
     use crate::filter::lzw_flate::{PredictorParams, apply_predictor};
     use crate::object::Dict;
 
+    /// Decodes at most `limit` bytes; `expected` sizes the output buffer up front.
     #[cfg(feature = "unsafe")]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
+    pub(crate) fn decode(
+        data: &[u8],
+        params: &Dict<'_>,
+        limit: usize,
+        expected: Option<usize>,
+    ) -> Option<Vec<u8>> {
         use flate2::read::{DeflateDecoder, ZlibDecoder};
         use std::io::Read;
 
-        fn zlib_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = ZlibDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
+        fn read(decoder: impl Read, limit: usize, expected: Option<usize>) -> Option<Vec<u8>> {
+            let mut result = Vec::with_capacity(expected.unwrap_or(0));
+            decoder
+                .take(limit as u64)
+                .read_to_end(&mut result)
+                .ok()
+                .map(|_| result)
         }
 
-        fn deflate_stream(data: &[u8]) -> Option<Vec<u8>> {
-            let mut decoder = DeflateDecoder::new(data);
-            let mut result = Vec::new();
-            decoder.read_to_end(&mut result).ok().map(|_| result)
-        }
-
-        let decoded = zlib_stream(data)
-            .or_else(|| deflate_stream(data))
+        let decoded = read(ZlibDecoder::new(data), limit, expected)
+            .or_else(|| read(DeflateDecoder::new(data), limit, expected))
             .or_else(|| {
                 warn!("flate stream is broken, decoding with fallback");
 
-                fallback::decode(data)
+                fallback::decode(data, limit)
             })?;
         let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params)
     }
 
     #[cfg(not(feature = "unsafe"))]
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
-        let decoded = fallback::decode(data)?;
+    pub(crate) fn decode(
+        data: &[u8],
+        params: &Dict<'_>,
+        limit: usize,
+        _expected: Option<usize>,
+    ) -> Option<Vec<u8>> {
+        let decoded = fallback::decode(data, limit)?;
         let params = PredictorParams::from_params(params);
         apply_predictor(decoded, &params)
     }
@@ -51,11 +59,11 @@ pub(crate) mod flate {
         use alloc::vec;
         use alloc::vec::Vec;
 
-        pub(crate) fn decode(data: &[u8]) -> Option<Vec<u8>> {
-            flate_decode(data)
+        pub(crate) fn decode(data: &[u8], limit: usize) -> Option<Vec<u8>> {
+            flate_decode(data, limit)
         }
 
-        fn flate_decode(data: &[u8]) -> Option<Vec<u8>> {
+        fn flate_decode(data: &[u8], limit: usize) -> Option<Vec<u8>> {
             if data.len() >= 2 {
                 let cmf = data[0];
                 let flg = data[1];
@@ -64,12 +72,12 @@ pub(crate) mod flate {
                     && ((cmf as u16) << 8 | flg as u16).is_multiple_of(31)
                     && (flg & 0x20) == 0
                 {
-                    let mut stream = FlateStream::new(&data[2..]);
+                    let mut stream = FlateStream::new(&data[2..], limit);
                     return stream.decode();
                 }
             }
 
-            let mut stream = FlateStream::new(data);
+            let mut stream = FlateStream::new(data, limit);
             stream.decode()
         }
 
@@ -79,26 +87,29 @@ pub(crate) mod flate {
             code_buf: u32,
             code_size: u8,
             output: Vec<u8>,
+            limit: usize,
             eof: bool,
         }
 
         impl<'a> FlateStream<'a> {
-            fn new(data: &'a [u8]) -> Self {
+            fn new(data: &'a [u8], limit: usize) -> Self {
                 FlateStream {
                     data,
                     pos: 0,
                     code_buf: 0,
                     code_size: 0,
                     output: Vec::new(),
+                    limit,
                     eof: false,
                 }
             }
 
             fn decode(&mut self) -> Option<Vec<u8>> {
-                while !self.eof && self.pos < self.data.len() {
+                while !self.eof && self.pos < self.data.len() && self.output.len() < self.limit {
                     self.read_block();
                 }
 
+                self.output.truncate(self.limit);
                 Some(core::mem::take(&mut self.output))
             }
 
@@ -273,7 +284,7 @@ pub(crate) mod flate {
                     }
                 };
 
-                loop {
+                while self.output.len() < self.limit {
                     let code1 = match self.get_code(&lit_code_table) {
                         Some(c) => c,
                         None => {
@@ -570,10 +581,12 @@ pub(crate) mod lzw {
     use alloc::vec::Vec;
 
     /// Decode a LZW-encoded stream.
-    pub(crate) fn decode(data: &[u8], params: &Dict<'_>) -> Option<Vec<u8>> {
+    /// Decodes at most `limit` bytes.
+    pub(crate) fn decode(data: &[u8], params: &Dict<'_>, limit: usize) -> Option<Vec<u8>> {
         let params = PredictorParams::from_params(params);
 
-        let decoded = decode_impl(data, params.early_change)?;
+        let mut decoded = decode_impl(data, params.early_change, limit)?;
+        decoded.truncate(limit);
 
         apply_predictor(decoded, &params)
     }
@@ -583,14 +596,14 @@ pub(crate) mod lzw {
     const MAX_ENTRIES: usize = 4096;
     const INITIAL_SIZE: u16 = 258;
 
-    fn decode_impl(data: &[u8], early_change: bool) -> Option<Vec<u8>> {
+    fn decode_impl(data: &[u8], early_change: bool, limit: usize) -> Option<Vec<u8>> {
         let mut table = Table::new(early_change);
         let mut bit_size = table.code_length();
         let mut reader = BitReader::new(data);
         let mut decoded = vec![];
         let mut prev = None;
 
-        loop {
+        while decoded.len() < limit {
             let next = match reader.read(bit_size) {
                 Some(code) => code as usize,
                 None => {
@@ -637,6 +650,8 @@ pub(crate) mod lzw {
                 }
             }
         }
+
+        Some(decoded)
     }
 
     struct Table {
@@ -1033,7 +1048,7 @@ mod tests {
     #[test]
     fn decode_lzw() {
         let input = [0x80, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
-        let decoded = lzw::decode(&input, &Dict::default()).unwrap();
+        let decoded = lzw::decode(&input, &Dict::default(), usize::MAX).unwrap();
 
         assert_eq!(decoded, vec![45, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
     }
@@ -1044,7 +1059,7 @@ mod tests {
             0x78, 0x9c, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0, 0x5, 0x8c, 0x1, 0xf5,
         ];
 
-        let decoded = flate::decode(&input, &Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default(), usize::MAX, None).unwrap();
         assert_eq!(decoded, b"Hello");
     }
 
@@ -1052,7 +1067,7 @@ mod tests {
     fn decode_flate() {
         let input = [0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x7, 0x0];
 
-        let decoded = flate::decode(&input, &Dict::default()).unwrap();
+        let decoded = flate::decode(&input, &Dict::default(), usize::MAX, None).unwrap();
         assert_eq!(decoded, b"Hello");
     }
     

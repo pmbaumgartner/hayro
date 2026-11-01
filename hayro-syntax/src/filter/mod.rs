@@ -20,7 +20,22 @@ use crate::object::Dict;
 use crate::object::Name;
 use crate::object::dict::keys::*;
 use crate::object::stream::{DecodeFailure, FilterResult, ImageDecodeParams};
+use core::cell::Cell;
 use core::ops::Deref;
+
+/// The most bytes one filter may decode a stream to. A stream that would
+/// decode to more fails, and `take_oversized` reports it.
+pub const MAX_DECODED_BYTES: usize = 256 << 20;
+
+std::thread_local! {
+    static OVERSIZED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a stream failed on this thread for exceeding `MAX_DECODED_BYTES`
+/// since the last call. Clears the flag.
+pub fn take_oversized() -> bool {
+    OVERSIZED.replace(false)
+}
 
 /// A data filter.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -88,7 +103,12 @@ impl Filter {
         data: &[u8],
         params: &Dict<'_>,
         #[cfg_attr(not(feature = "images"), allow(unused))] image_params: &ImageDecodeParams,
+        expected: Option<usize>,
     ) -> Result<FilterResult<'static>, DecodeFailure> {
+        // An expected size (an image's raw samples) bounds the output, and
+        // extra data is dropped. Otherwise one byte past the cap fails.
+        let expected = expected.filter(|&n| n <= MAX_DECODED_BYTES);
+        let limit = expected.unwrap_or(MAX_DECODED_BYTES + 1);
         let res = match self {
             Self::AsciiHexDecode => ascii_hex::decode(data)
                 .map(FilterResult::from_data)
@@ -96,13 +116,13 @@ impl Filter {
             Self::Ascii85Decode => ascii_85::decode(data)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
-            Self::RunLengthDecode => run_length::decode(data)
+            Self::RunLengthDecode => run_length::decode(data, limit)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
-            Self::LzwDecode => lzw_flate::lzw::decode(data, params)
+            Self::LzwDecode => lzw_flate::lzw::decode(data, params, limit)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
-            Self::FlateDecode => lzw_flate::flate::decode(data, params)
+            Self::FlateDecode => lzw_flate::flate::decode(data, params, limit, expected)
                 .map(FilterResult::from_data)
                 .ok_or(DecodeFailure::StreamDecode),
             #[cfg(feature = "images")]
@@ -125,6 +145,13 @@ impl Filter {
                 Err(DecodeFailure::ImageDecode)
             }
             _ => Err(DecodeFailure::StreamDecode),
+        };
+        let res = match res {
+            Ok(result) if result.data.len() > MAX_DECODED_BYTES => {
+                OVERSIZED.set(true);
+                Err(DecodeFailure::StreamDecode)
+            }
+            res => res,
         };
 
         if res.is_err() {
