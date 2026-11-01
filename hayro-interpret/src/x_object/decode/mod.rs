@@ -173,7 +173,63 @@ fn decode_u8_samples(
     };
 
     match bits_per_component {
-        1..8 | 9..16 => {
+        // Every sample value maps through a table per component, built with
+        // `decode_component`, so the output is the same without float math per
+        // sample. Rows start on a byte; samples past the data read as 0.
+        1..8 => {
+            let bpc = bits_per_component as usize;
+            let lut = (0..num_components)
+                .map(|c| {
+                    (0..1_u32 << bpc)
+                        .map(|v| decode_component(v, c))
+                        .collect::<Option<Vec<u8>>>()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let per_row = width as usize * num_components;
+            let row_bytes = (per_row * bpc).div_ceil(8);
+            let mask = (1_u16 << bpc) - 1;
+            let mut buf = Vec::with_capacity(capacity);
+            if num_components == 1 && 8 % bpc == 0 {
+                let lut = &lut[0];
+                for y in 0..height as usize {
+                    let start = (y * row_bytes).min(data.len());
+                    let row = &data[start..(start + row_bytes).min(data.len())];
+                    let end = buf.len() + per_row;
+                    for &byte in row {
+                        for k in (0..8 / bpc).rev() {
+                            buf.push(lut[usize::from((u16::from(byte) >> (k * bpc)) & mask)]);
+                        }
+                    }
+                    buf.truncate(end);
+                    buf.resize(end, lut[0]);
+                }
+
+                return Some(buf);
+            }
+            for y in 0..height as usize {
+                let row = data.get(y * row_bytes..).unwrap_or(&[]);
+                for i in 0..per_row {
+                    let bit = i * bpc;
+                    let (first, last) = (bit / 8, (bit + bpc - 1) / 8);
+                    let value = if last < row.len() {
+                        // A sample spans at most two bytes, most significant bit first.
+                        let hi = u16::from(row[first]) << 8;
+                        let lo = if last > first {
+                            u16::from(row[last])
+                        } else {
+                            0
+                        };
+                        ((hi | lo) >> (16 - bit % 8 - bpc)) & mask
+                    } else {
+                        0
+                    };
+                    buf.push(lut[i % num_components][value as usize]);
+                }
+            }
+
+            Some(buf)
+        }
+        9..16 => {
             let mut buf = Vec::with_capacity(capacity);
             for_each_sample(
                 data,
@@ -189,12 +245,21 @@ fn decode_u8_samples(
 
             Some(buf)
         }
-        8 => Some(
-            data.iter()
-                .enumerate()
-                .map(|(index, value)| decode_component(*value as u32, index))
-                .collect::<Option<Vec<_>>>()?,
-        ),
+        8 => {
+            let lut = (0..num_components)
+                .map(|c| {
+                    (0..256)
+                        .map(|v| decode_component(v, c))
+                        .collect::<Option<Vec<u8>>>()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(
+                data.iter()
+                    .enumerate()
+                    .map(|(index, value)| lut[index % num_components][*value as usize])
+                    .collect(),
+            )
+        }
         16 => Some(
             data.chunks_exact(2)
                 .enumerate()

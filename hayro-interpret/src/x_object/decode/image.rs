@@ -130,19 +130,12 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
             components
         };
 
-        if !is_indexed
-            && self.color_key_mask.is_none()
-            && self.obj.stream.dict().get::<u8>(SMASK_IN_DATA) != Some(1)
-            && let Some((tw, th)) = self.target_dimension
-        {
-            components = super::box_reduce(
-                components,
-                &mut self.ctx.width,
-                &mut self.ctx.height,
-                &mut self.ctx.scale_factors,
-                num_components,
-                (tw, th),
-            );
+        // Palette indices can't be averaged, so indexed images are reduced
+        // after the lookup instead.
+        let reducible = self.color_key_mask.is_none()
+            && self.obj.stream.dict().get::<u8>(SMASK_IN_DATA) != Some(1);
+        if !is_indexed && reducible {
+            components = self.box_reduce(components, num_components);
         }
 
         if self
@@ -154,6 +147,9 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         {
             if let Some(transfer_function) = &self.obj.transfer_function {
                 transfer_function.apply_to(&mut components);
+            }
+            if is_indexed && reducible {
+                components = self.box_reduce(components, 1);
             }
 
             return Some(ImageData::Luma(LumaData {
@@ -168,8 +164,28 @@ impl<'a, 'b> ImageDecoder<'a, 'b> {
         let mut rgb_data = self.convert_to_rgb(components)?;
 
         self.apply_transfer_function(&mut rgb_data);
+        if is_indexed && reducible {
+            rgb_data.data = self.box_reduce(rgb_data.data, 3);
+            rgb_data.width = self.ctx.width;
+            rgb_data.height = self.ctx.height;
+            rgb_data.scale_factors = self.ctx.scale_factors;
+        }
 
         Some(ImageData::Rgb(rgb_data))
+    }
+
+    fn box_reduce(&mut self, data: Vec<u8>, num_components: usize) -> Vec<u8> {
+        match self.target_dimension {
+            Some(target) => super::box_reduce(
+                data,
+                &mut self.ctx.width,
+                &mut self.ctx.height,
+                &mut self.ctx.scale_factors,
+                num_components,
+                target,
+            ),
+            None => data,
+        }
     }
 
     fn convert_to_rgb(&self, mut decoded: Vec<u8>) -> Option<RgbData> {
